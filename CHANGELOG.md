@@ -1,3 +1,10 @@
+## [1.2.5](https://github.com/wyre-technology/itglue-mcp/compare/v1.2.4...v1.2.5) (2026-03-04)
+
+
+### Bug Fixes
+
+* strip org scope from MCPB bundle filename ([66f2479](https://github.com/wyre-technology/itglue-mcp/commit/66f2479a93066d2a015e24dc3c77a37dffd41488))
+
 ## [1.2.4](https://github.com/wyre-technology/itglue-mcp/compare/v1.2.3...v1.2.4) (2026-03-04)
 
 
