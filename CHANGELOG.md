@@ -1,3 +1,10 @@
+## [1.2.8](https://github.com/wyre-technology/itglue-mcp/compare/v1.2.7...v1.2.8) (2026-03-05)
+
+
+### Bug Fixes
+
+* **documents:** revert to correct /relationships/documents endpoint + 404 error guidance ([f4f973d](https://github.com/wyre-technology/itglue-mcp/commit/f4f973d3a87d65fcc80027c39250438003c763e4))
+
 ## [1.2.7](https://github.com/wyre-technology/itglue-mcp/compare/v1.2.6...v1.2.7) (2026-03-05)
 
 
