@@ -1092,7 +1092,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             data: {
               type: "document-sections",
               attributes: {
-                "section-type": apiSectionType,
+                "resource-type": apiSectionType,
                 content: args.content,
               },
             },
