@@ -292,7 +292,7 @@ function createClient(credentials: GatewayCredentials): ITGlueClient {
  * Create a fresh MCP Server with all tool handlers registered.
  * Called per-request in HTTP (stateless) mode so each initialize gets a clean server.
  */
-function createMcpServer(): Server {
+function createMcpServer(credentialOverrides?: GatewayCredentials): Server {
   const server = new Server(
     {
       name: "itglue-mcp",
@@ -900,7 +900,7 @@ function createMcpServer(): Server {
 // Handle tool calls
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
-  const credentials = getCredentialsFromEnv();
+  const credentials = credentialOverrides ?? getCredentialsFromEnv();
 
   if (!credentials.apiKey) {
     return {
@@ -1601,16 +1601,47 @@ async function startHttpTransport(): Promise<void> {
 
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok' }));
+    res.end(JSON.stringify({
+      status: 'ok',
+      transport: 'sse',
+      authMode: isGatewayMode ? 'gateway' : 'env',
+      timestamp: new Date().toISOString(),
+    }));
     return;
+  }
   }
 
   // 1. Establish the SSE Connection
   if (url.pathname === '/sse') {
+    // Security: extract per-session credentials (prevents cross-tenant credential leak)
+    let gatewayCredentials: GatewayCredentials | undefined;
+    if (isGatewayMode) {
+      const headers = req.headers as Record<string, string | string[] | undefined>;
+      const apiKey =
+        (headers['x-itglue-api-key'] as string) ||
+        (headers['x-api-key'] as string);
+      if (!apiKey) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          error: 'Missing credentials',
+          message: 'Gateway mode requires X-ITGlue-API-Key header',
+        }));
+        return;
+      }
+      const baseUrl = headers['x-itglue-base-url'] as string | undefined;
+      const region = headers['x-itglue-region'] as string | undefined;
+      gatewayCredentials = {
+        apiKey,
+        region: (region || 'us') as ITGlueRegion,
+        baseUrl: baseUrl || undefined,
+      };
+    }
     const transport = new SSEServerTransport('/message', res);
     const sessionId = Math.random().toString(36).substring(2);
     sseTransports.set(sessionId, transport);
-    await server.connect(transport as any);
+    // Create isolated per-session server with scoped credentials
+    const sessionServer = createMcpServer(gatewayCredentials);
+    await sessionServer.connect(transport as any);
     return;
   }
 
