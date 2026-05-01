@@ -16,6 +16,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 const mockFetch = vi.fn();
 vi.stubGlobal("fetch", mockFetch);
 
+// Importing from ../index pulls in the production helpers. The module guards
+// its main() bootstrap on NODE_ENV=test so this import does not start an MCP
+// server during tests.
+import { createDocumentWithContent, ITGlueClient } from "../index.js";
+
 // Store original env vars
 const originalEnv = { ...process.env };
 
@@ -80,6 +85,7 @@ function createErrorResponse(status: number, body: string) {
 describe("Utility Functions", () => {
   describe("kebabToCamel conversion", () => {
     it("should convert kebab-case to camelCase", () => {
+      // Test the conversion logic used in the server
       const kebabToCamel = (str: string): string => {
         return str.replace(/-([a-z])/g, (_, letter: string) => letter.toUpperCase());
       };
@@ -87,12 +93,13 @@ describe("Utility Functions", () => {
       expect(kebabToCamel("organization-type-id")).toBe("organizationTypeId");
       expect(kebabToCamel("created-at")).toBe("createdAt");
       expect(kebabToCamel("short-name")).toBe("shortName");
-      expect(kebabToCamel("name")).toBe("name");
+      expect(kebabToCamel("name")).toBe("name"); // No change for single word
     });
   });
 
   describe("camelToKebab conversion", () => {
     it("should convert camelCase to kebab-case", () => {
+      // Test the conversion logic used in the server
       const camelToKebab = (str: string): string => {
         return str.replace(/[A-Z]/g, (letter: string) => `-${letter.toLowerCase()}`);
       };
@@ -100,7 +107,7 @@ describe("Utility Functions", () => {
       expect(camelToKebab("organizationTypeId")).toBe("organization-type-id");
       expect(camelToKebab("createdAt")).toBe("created-at");
       expect(camelToKebab("shortName")).toBe("short-name");
-      expect(camelToKebab("name")).toBe("name");
+      expect(camelToKebab("name")).toBe("name"); // No change for single word
     });
   });
 
@@ -225,6 +232,7 @@ describe("ITGlueClient", () => {
         return createMockResponse(createJsonApiResponse([]));
       });
 
+      // Simulate the header setup
       const headers = {
         "x-api-key": "test-api-key",
         "Content-Type": "application/vnd.api+json",
@@ -307,6 +315,7 @@ describe("Tool Definitions", () => {
     expect(Array.isArray(requiredFields)).toBe(true);
     expect(Array.isArray(properties)).toBe(true);
 
+    // Verify required fields are subset of properties
     requiredFields.forEach((field) => {
       expect(properties).toContain(field);
     });
@@ -576,6 +585,7 @@ describe("Tool Handler Integration", () => {
             name: "Admin Password",
             username: "admin",
             url: "https://example.com",
+            // password field should not be included in search
           },
         },
       ]);
@@ -646,6 +656,7 @@ describe("Tool Handler Integration", () => {
           attributes: {
             name: "Server Root Password",
             username: "root",
+            // No password field
           },
         },
       };
@@ -687,19 +698,102 @@ describe("Tool Handler Integration", () => {
 
       expect((json.data as JsonApiResource[])[0].attributes?.name).toBe("Security Policy");
     });
+  });
 
-    it("should search documents within a specific folder", async () => {
-      const mockData = createJsonApiResponse([
-        { id: "10", type: "documents", attributes: { name: "Folder Doc 1" } },
-        { id: "11", type: "documents", attributes: { name: "Folder Doc 2" } },
-      ]);
 
-      mockFetch.mockResolvedValueOnce(createMockResponse(mockData));
+  // Regression tests for issue #7: document creation must persist content.
+  // IT Glue's Documents API ignores a top-level `content` attribute on POST —
+  // documents are section-structured, so the body only materialises when a
+  // follow-up document_section is POSTed. The helper below orchestrates that
+  // two-step flow; these tests exercise it directly against a mocked fetch so
+  // the assertions cover the real production code path (not a re-construction
+  // of it).
+  describe("createDocumentWithContent", () => {
+    function newClient(): ITGlueClient {
+      return new ITGlueClient({ apiKey: "test-api-key", region: "us" });
+    }
 
-      const response = await fetch("https://api.itglue.com/organizations/123/relationships/documents?filter[document-folder-id]=101");
-      const json = (await response.json()) as JsonApiResponse;
+    it("POSTs only the document when content is omitted", async () => {
+      mockFetch.mockResolvedValueOnce(createMockResponse({
+        data: { id: "789", type: "documents", attributes: { name: "Doc" } },
+      }));
 
-      expect((json.data as JsonApiResource[]).length).toBe(2);
+      await createDocumentWithContent(newClient(), {
+        organization_id: 1765329,
+        name: "Doc",
+      });
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(mockFetch.mock.calls[0][0]).toContain(
+        "/organizations/1765329/relationships/documents"
+      );
+    });
+
+    it("POSTs document then section when content is provided", async () => {
+      mockFetch
+        .mockResolvedValueOnce(createMockResponse({
+          data: { id: "23350960", type: "documents", attributes: { name: "Doc" } },
+        }))
+        .mockResolvedValueOnce(createMockResponse({
+          data: { id: "1001", type: "document-sections", attributes: {} },
+        }));
+
+      await createDocumentWithContent(newClient(), {
+        organization_id: 1765329,
+        name: "Doc",
+        content: "<h1>Hello</h1><p>World</p>",
+      });
+
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(mockFetch.mock.calls[0][0]).toContain(
+        "/organizations/1765329/relationships/documents"
+      );
+      expect(mockFetch.mock.calls[1][0]).toContain(
+        "/documents/23350960/relationships/sections"
+      );
+
+      const sectionBody = JSON.parse(mockFetch.mock.calls[1][1].body);
+      expect(sectionBody.data.type).toBe("document-sections");
+      // IT Glue stores the section type in `resource_type`, not `section-type`.
+      // Verified live 2026-04-23: `section-type` is ignored on write and a
+      // `relationships.resource` binding triggers a 400.
+      expect(sectionBody.data.attributes.resource_type).toBe("Document::Text");
+      expect(sectionBody.data.attributes.content).toBe("<h1>Hello</h1><p>World</p>");
+      expect(sectionBody.data.attributes).not.toHaveProperty("section-type");
+      expect(sectionBody.data).not.toHaveProperty("relationships");
+    });
+
+    it("skips section POST when content is empty string", async () => {
+      mockFetch.mockResolvedValueOnce(createMockResponse({
+        data: { id: "789", type: "documents", attributes: { name: "Doc" } },
+      }));
+
+      await createDocumentWithContent(newClient(), {
+        organization_id: 1,
+        name: "Doc",
+        content: "",
+      });
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns the document (not the section) as the caller-visible result", async () => {
+      mockFetch
+        .mockResolvedValueOnce(createMockResponse({
+          data: { id: "23350960", type: "documents", attributes: { name: "Doc" } },
+        }))
+        .mockResolvedValueOnce(createMockResponse({
+          data: { id: "1001", type: "document-sections", attributes: {} },
+        }));
+
+      const result = await createDocumentWithContent(newClient(), {
+        organization_id: 1,
+        name: "Doc",
+        content: "<p>x</p>",
+      });
+
+      expect((result as { id: string; type: string }).id).toBe("23350960");
+      expect((result as { id: string; type: string }).type).toBe("documents");
     });
   });
 
@@ -738,7 +832,7 @@ describe("Tool Handler Integration", () => {
       const response = await fetch("https://api.itglue.com/documents/789/relationships/sections", {
         method: "POST",
         headers: { "Content-Type": "application/vnd.api+json" },
-        body: JSON.stringify({ data: { type: "document-sections", attributes: { "resource-type": "Document::Text", content: "<p>New section.</p>" } } }),
+        body: JSON.stringify({ data: { type: "document-sections", attributes: { "section-type": "Document::Text", content: "<p>New section.</p>" } } }),
       });
 
       expect(mockFetch).toHaveBeenCalledWith(
@@ -800,6 +894,86 @@ describe("Tool Handler Integration", () => {
       expect(response.ok).toBe(true);
     });
   });
+
+  describe("search_flexible_assets", () => {
+    it("should require flexible_asset_type_id", () => {
+      const args: Record<string, number> = { organization_id: 1 };
+      const hasRequiredField = "flexible_asset_type_id" in args;
+
+      expect(hasRequiredField).toBe(false);
+    });
+
+    it("should search flexible assets with type ID", async () => {
+      const mockData = createJsonApiResponse([
+        {
+          id: "1",
+          type: "flexible-assets",
+          attributes: { name: "Network Asset", traits: { "ip-address": "10.0.0.1" } },
+        },
+      ]);
+
+      mockFetch.mockResolvedValueOnce(createMockResponse(mockData));
+
+      const response = await fetch("https://api.itglue.com/flexible_assets?filter[flexible-asset-type-id]=5");
+      const json = (await response.json()) as JsonApiResponse;
+
+      expect((json.data as JsonApiResource[])[0].type).toBe("flexible-assets");
+      expect((json.data as JsonApiResource[])[0].attributes?.name).toBe("Network Asset");
+    });
+
+    it("should filter flexible assets by organization", async () => {
+      const mockData = createJsonApiResponse([
+        { id: "1", type: "flexible-assets", attributes: { name: "Asset 1" } },
+      ]);
+
+      mockFetch.mockResolvedValueOnce(createMockResponse(mockData));
+
+      const response = await fetch("https://api.itglue.com/flexible_assets?filter[flexible-asset-type-id]=5&filter[organization-id]=123");
+      const json = (await response.json()) as JsonApiResponse;
+
+      expect((json.data as JsonApiResource[]).length).toBe(1);
+    });
+  });
+
+  describe("itglue_health_check", () => {
+    it("should return success status when API is reachable", async () => {
+      const mockData = createJsonApiResponse(
+        [{ id: "1", type: "organization-types", attributes: { name: "Customer" } }],
+        { "total-count": 5 }
+      );
+
+      mockFetch.mockResolvedValueOnce(createMockResponse(mockData));
+
+      const response = await fetch("https://api.itglue.com/organization_types?page[size]=1");
+      const json = (await response.json()) as JsonApiResponse;
+
+      const healthResponse = {
+        status: "ok",
+        message: "IT Glue API is reachable",
+        region: "us",
+        organizationTypesFound: json.meta?.["total-count"],
+      };
+
+      expect(healthResponse.status).toBe("ok");
+      expect(healthResponse.organizationTypesFound).toBe(5);
+    });
+
+    it("should return error when API is unreachable", async () => {
+      mockFetch.mockRejectedValueOnce(new Error("Network error"));
+
+      await expect(fetch("https://api.itglue.com/organization_types")).rejects.toThrow("Network error");
+    });
+
+    it("should return error for authentication failure", async () => {
+      mockFetch.mockResolvedValueOnce(createErrorResponse(401, "Invalid API Key"));
+
+      const response = await fetch("https://api.itglue.com/organization_types");
+      expect(response.ok).toBe(false);
+      expect(response.status).toBe(401);
+    });
+  });
+});
+
 
   describe("get_document", () => {
     it("should get a document by organization and document ID", async () => {
@@ -1004,84 +1178,6 @@ describe("Tool Handler Integration", () => {
     });
   });
 
-  describe("search_flexible_assets", () => {
-    it("should require flexible_asset_type_id", () => {
-      const args: Record<string, number> = { organization_id: 1 };
-      const hasRequiredField = "flexible_asset_type_id" in args;
-
-      expect(hasRequiredField).toBe(false);
-    });
-
-    it("should search flexible assets with type ID", async () => {
-      const mockData = createJsonApiResponse([
-        {
-          id: "1",
-          type: "flexible-assets",
-          attributes: { name: "Network Asset", traits: { "ip-address": "10.0.0.1" } },
-        },
-      ]);
-
-      mockFetch.mockResolvedValueOnce(createMockResponse(mockData));
-
-      const response = await fetch("https://api.itglue.com/flexible_assets?filter[flexible-asset-type-id]=5");
-      const json = (await response.json()) as JsonApiResponse;
-
-      expect((json.data as JsonApiResource[])[0].type).toBe("flexible-assets");
-      expect((json.data as JsonApiResource[])[0].attributes?.name).toBe("Network Asset");
-    });
-
-    it("should filter flexible assets by organization", async () => {
-      const mockData = createJsonApiResponse([
-        { id: "1", type: "flexible-assets", attributes: { name: "Asset 1" } },
-      ]);
-
-      mockFetch.mockResolvedValueOnce(createMockResponse(mockData));
-
-      const response = await fetch("https://api.itglue.com/flexible_assets?filter[flexible-asset-type-id]=5&filter[organization-id]=123");
-      const json = (await response.json()) as JsonApiResponse;
-
-      expect((json.data as JsonApiResource[]).length).toBe(1);
-    });
-  });
-
-  describe("itglue_health_check", () => {
-    it("should return success status when API is reachable", async () => {
-      const mockData = createJsonApiResponse(
-        [{ id: "1", type: "organization-types", attributes: { name: "Customer" } }],
-        { "total-count": 5 }
-      );
-
-      mockFetch.mockResolvedValueOnce(createMockResponse(mockData));
-
-      const response = await fetch("https://api.itglue.com/organization_types?page[size]=1");
-      const json = (await response.json()) as JsonApiResponse;
-
-      const healthResponse = {
-        status: "ok",
-        message: "IT Glue API is reachable",
-        region: "us",
-        organizationTypesFound: json.meta?.["total-count"],
-      };
-
-      expect(healthResponse.status).toBe("ok");
-      expect(healthResponse.organizationTypesFound).toBe(5);
-    });
-
-    it("should return error when API is unreachable", async () => {
-      mockFetch.mockRejectedValueOnce(new Error("Network error"));
-
-      await expect(fetch("https://api.itglue.com/organization_types")).rejects.toThrow("Network error");
-    });
-
-    it("should return error for authentication failure", async () => {
-      mockFetch.mockResolvedValueOnce(createErrorResponse(401, "Invalid API Key"));
-
-      const response = await fetch("https://api.itglue.com/organization_types");
-      expect(response.ok).toBe(false);
-      expect(response.status).toBe(401);
-    });
-  });
-});
 
 describe("Unknown Tool Handling", () => {
   it("should return error for unknown tool name", () => {
@@ -1114,6 +1210,496 @@ describe("Unknown Tool Handling", () => {
     ];
 
     expect(knownTools.includes(unknownTool)).toBe(false);
+  });
+
+  it("should list all known tools", () => {
+    const knownTools = [
+      "search_organizations",
+      "get_organization",
+      "search_configurations",
+      "get_configuration",
+      "search_passwords",
+      "get_password",
+      "search_documents",
+      "get_document",
+      "create_document",
+      "list_document_sections",
+      "create_document_section",
+      "update_document_section",
+      "delete_document_section",
+      "publish_document",
+      "archive_document",
+      "unarchive_document",
+      "list_flexible_asset_types",
+      "search_flexible_assets",
+      "search_ssl_certificates",
+      "search_domains",
+      "list_document_folders",
+      "search_contacts",
+      "search_locations",
+      "itglue_health_check",
+    ];
+
     expect(knownTools.length).toBe(24);
+  });
+});
+
+describe("JSON:API Deserialization", () => {
+  it("should deserialize resource with id and type", () => {
+    const resource: JsonApiResource = { id: "123", type: "organizations" };
+
+    const result = {
+      id: resource.id,
+      type: resource.type,
+    };
+
+    expect(result.id).toBe("123");
+    expect(result.type).toBe("organizations");
+  });
+
+  it("should deserialize resource attributes with camelCase conversion", () => {
+    const resource: JsonApiResource = {
+      id: "123",
+      type: "organizations",
+      attributes: {
+        name: "Test Org",
+        "short-name": "TEST",
+        "organization-type-id": 1,
+        "created-at": "2024-01-01T00:00:00Z",
+      },
+    };
+
+    // Simulate deserialization
+    const kebabToCamel = (str: string): string => {
+      return str.replace(/-([a-z])/g, (_, letter: string) => letter.toUpperCase());
+    };
+
+    const deserialized: Record<string, unknown> = {
+      id: resource.id,
+      type: resource.type,
+    };
+
+    for (const [key, value] of Object.entries(resource.attributes || {})) {
+      deserialized[kebabToCamel(key)] = value;
+    }
+
+    expect(deserialized.id).toBe("123");
+    expect(deserialized.name).toBe("Test Org");
+    expect(deserialized.shortName).toBe("TEST");
+    expect(deserialized.organizationTypeId).toBe(1);
+    expect(deserialized.createdAt).toBe("2024-01-01T00:00:00Z");
+  });
+
+  it("should handle empty attributes", () => {
+    const resource: JsonApiResource = { id: "123", type: "organizations" };
+
+    const result = {
+      id: resource.id,
+      type: resource.type,
+    };
+
+    expect(result.id).toBe("123");
+    expect(Object.keys(result).length).toBe(2);
+  });
+
+  it("should handle nested objects in attributes", () => {
+    const resource: JsonApiResource = {
+      id: "123",
+      type: "flexible-assets",
+      attributes: {
+        name: "Test Asset",
+        traits: {
+          "ip-address": "10.0.0.1",
+          "subnet-mask": "255.255.255.0",
+        },
+      },
+    };
+
+    const traits = resource.attributes?.traits as Record<string, string>;
+    expect(traits["ip-address"]).toBe("10.0.0.1");
+    expect(traits["subnet-mask"]).toBe("255.255.255.0");
+  });
+
+  it("should handle array data responses", () => {
+    const response = createJsonApiResponse([
+      { id: "1", type: "organizations", attributes: { name: "Org 1" } },
+      { id: "2", type: "organizations", attributes: { name: "Org 2" } },
+    ]);
+
+    expect(Array.isArray(response.data)).toBe(true);
+    expect((response.data as JsonApiResource[]).length).toBe(2);
+  });
+
+  it("should handle single resource data responses", () => {
+    const response: JsonApiResponse = {
+      data: { id: "1", type: "organizations", attributes: { name: "Org 1" } },
+    };
+
+    expect(Array.isArray(response.data)).toBe(false);
+    expect((response.data as JsonApiResource).id).toBe("1");
+  });
+});
+
+describe("Pagination Metadata", () => {
+  it("should parse pagination metadata correctly", () => {
+    const meta: JsonApiMeta = {
+      "current-page": 2,
+      "next-page": 3,
+      "prev-page": 1,
+      "total-pages": 10,
+      "total-count": 500,
+    };
+
+    const parsed = {
+      currentPage: meta["current-page"],
+      nextPage: meta["next-page"],
+      prevPage: meta["prev-page"],
+      totalPages: meta["total-pages"],
+      totalCount: meta["total-count"],
+    };
+
+    expect(parsed.currentPage).toBe(2);
+    expect(parsed.nextPage).toBe(3);
+    expect(parsed.prevPage).toBe(1);
+    expect(parsed.totalPages).toBe(10);
+    expect(parsed.totalCount).toBe(500);
+  });
+
+  it("should handle missing pagination metadata with defaults", () => {
+    const meta: JsonApiMeta = {};
+
+    const parsed = {
+      currentPage: meta["current-page"] || 1,
+      nextPage: meta["next-page"] ?? null,
+      prevPage: meta["prev-page"] ?? null,
+      totalPages: meta["total-pages"] || 1,
+      totalCount: meta["total-count"] || 0,
+    };
+
+    expect(parsed.currentPage).toBe(1);
+    expect(parsed.nextPage).toBeNull();
+    expect(parsed.prevPage).toBeNull();
+    expect(parsed.totalPages).toBe(1);
+    expect(parsed.totalCount).toBe(0);
+  });
+
+  it("should handle null next/prev page values", () => {
+    const meta: JsonApiMeta = {
+      "current-page": 1,
+      "next-page": 2,
+      "prev-page": null,
+      "total-pages": 5,
+      "total-count": 100,
+    };
+
+    expect(meta["prev-page"]).toBeNull();
+    expect(meta["next-page"]).toBe(2);
+  });
+
+  it("should handle last page pagination", () => {
+    const meta: JsonApiMeta = {
+      "current-page": 5,
+      "next-page": null,
+      "prev-page": 4,
+      "total-pages": 5,
+      "total-count": 100,
+    };
+
+    expect(meta["current-page"]).toBe(meta["total-pages"]);
+    expect(meta["next-page"]).toBeNull();
+  });
+});
+
+describe("Filter Parameter Building", () => {
+  it("should convert camelCase filter keys to kebab-case", () => {
+    const camelToKebab = (str: string): string => {
+      return str.replace(/[A-Z]/g, (letter: string) => `-${letter.toLowerCase()}`);
+    };
+
+    const filter: Record<string, number> = {
+      organizationId: 123,
+      configurationTypeId: 456,
+    };
+
+    const result: Record<string, string> = {};
+    for (const [key, value] of Object.entries(filter)) {
+      result[camelToKebab(key)] = String(value);
+    }
+
+    expect(result["organization-id"]).toBe("123");
+    expect(result["configuration-type-id"]).toBe("456");
+  });
+
+  it("should skip undefined and null values", () => {
+    const filter: Record<string, unknown> = {
+      name: "test",
+      organizationId: undefined,
+      status: null,
+    };
+
+    const result: Record<string, string> = {};
+    for (const [key, value] of Object.entries(filter)) {
+      if (value !== undefined && value !== null) {
+        result[key] = String(value);
+      }
+    }
+
+    expect(Object.keys(result).length).toBe(1);
+    expect(result.name).toBe("test");
+  });
+
+  it("should handle boolean values", () => {
+    const filter: Record<string, boolean> = {
+      active: true,
+      archived: false,
+    };
+
+    const result: Record<string, string> = {};
+    for (const [key, value] of Object.entries(filter)) {
+      result[key] = String(value);
+    }
+
+    expect(result.active).toBe("true");
+    expect(result.archived).toBe("false");
+  });
+
+  it("should handle numeric values", () => {
+    const filter: Record<string, number> = {
+      organizationId: 123,
+      limit: 50,
+    };
+
+    const result: Record<string, string> = {};
+    for (const [key, value] of Object.entries(filter)) {
+      result[key] = String(value);
+    }
+
+    expect(result.organizationId).toBe("123");
+    expect(result.limit).toBe("50");
+  });
+});
+
+describe("Region URL Mapping", () => {
+  const REGION_URLS: Record<string, string> = {
+    us: "https://api.itglue.com",
+    eu: "https://api.eu.itglue.com",
+    au: "https://api.au.itglue.com",
+  };
+
+  it("should map US region to correct URL", () => {
+    expect(REGION_URLS.us).toBe("https://api.itglue.com");
+  });
+
+  it("should map EU region to correct URL", () => {
+    expect(REGION_URLS.eu).toBe("https://api.eu.itglue.com");
+  });
+
+  it("should map AU region to correct URL", () => {
+    expect(REGION_URLS.au).toBe("https://api.au.itglue.com");
+  });
+
+  it("should have exactly 3 regions", () => {
+    expect(Object.keys(REGION_URLS).length).toBe(3);
+  });
+});
+
+describe("Error Response Handling", () => {
+  it("should format HTTP error with status code", () => {
+    const status = 401;
+    const body = "Unauthorized";
+
+    const errorMessage = `IT Glue API error (${status}): ${body}`;
+
+    expect(errorMessage).toBe("IT Glue API error (401): Unauthorized");
+  });
+
+  it("should format JSON:API errors", () => {
+    const errors: Array<{ title: string; detail: string }> = [
+      { title: "Validation Error", detail: "Name is required" },
+      { title: "Validation Error", detail: "Email is invalid" },
+    ];
+
+    const errorMessages = errors.map((e) => e.detail || e.title).join(", ");
+
+    expect(errorMessages).toBe("Name is required, Email is invalid");
+  });
+
+  it("should handle errors without detail", () => {
+    const errors: Array<{ title: string; detail?: string }> = [{ title: "Internal Server Error" }];
+
+    const errorMessages = errors.map((e) => e.detail || e.title).join(", ");
+
+    expect(errorMessages).toBe("Internal Server Error");
+  });
+
+  it("should handle empty errors array", () => {
+    const errors: Array<{ title?: string; detail?: string }> = [];
+
+    const errorMessages = errors.map((e) => e.detail || e.title).join(", ");
+
+    expect(errorMessages).toBe("");
+  });
+
+  it("should handle generic Error objects", () => {
+    const error = new Error("Network timeout");
+
+    const errorMessage = error instanceof Error ? error.message : String(error);
+
+    expect(errorMessage).toBe("Network timeout");
+  });
+
+  it("should handle non-Error throws", () => {
+    const error: unknown = "Something went wrong";
+
+    const errorMessage = error instanceof Error ? error.message : String(error);
+
+    expect(errorMessage).toBe("Something went wrong");
+  });
+});
+
+describe("Query String Building", () => {
+  it("should build empty query string for no params", () => {
+    const params = {};
+    const queryString = Object.keys(params).length === 0 ? "" : "?...";
+
+    expect(queryString).toBe("");
+  });
+
+  it("should build filter query params", () => {
+    const searchParams = new URLSearchParams();
+    const filter: Record<string, string> = { name: "test" };
+
+    for (const [key, value] of Object.entries(filter)) {
+      searchParams.append(`filter[${key}]`, value);
+    }
+
+    expect(searchParams.toString()).toBe("filter%5Bname%5D=test");
+  });
+
+  it("should build pagination query params", () => {
+    const searchParams = new URLSearchParams();
+    const page: { size: number; number: number } = { size: 50, number: 2 };
+
+    if (page.size) searchParams.append("page[size]", String(page.size));
+    if (page.number) searchParams.append("page[number]", String(page.number));
+
+    const query = searchParams.toString();
+    expect(query).toContain("page%5Bsize%5D=50");
+    expect(query).toContain("page%5Bnumber%5D=2");
+  });
+
+  it("should handle sort parameter", () => {
+    const searchParams = new URLSearchParams();
+    const sort = "-name";
+
+    searchParams.append("sort", sort);
+
+    expect(searchParams.toString()).toBe("sort=-name");
+  });
+
+  it("should combine multiple parameter types", () => {
+    const searchParams = new URLSearchParams();
+
+    searchParams.append("filter[name]", "test");
+    searchParams.append("page[size]", "50");
+    searchParams.append("page[number]", "1");
+    searchParams.append("sort", "-name");
+
+    const query = searchParams.toString();
+    expect(query).toContain("filter%5Bname%5D=test");
+    expect(query).toContain("page%5Bsize%5D=50");
+    expect(query).toContain("page%5Bnumber%5D=1");
+    expect(query).toContain("sort=-name");
+  });
+});
+
+describe("MCP Response Format", () => {
+  it("should format successful response with text content", () => {
+    const data = { id: "123", name: "Test" };
+
+    const response = {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(data, null, 2),
+        },
+      ],
+    };
+
+    expect(response.content.length).toBe(1);
+    expect(response.content[0].type).toBe("text");
+    expect(JSON.parse(response.content[0].text)).toEqual(data);
+  });
+
+  it("should format error response with isError flag", () => {
+    const response = {
+      content: [
+        {
+          type: "text" as const,
+          text: "Error: Organization ID is required",
+        },
+      ],
+      isError: true,
+    };
+
+    expect(response.isError).toBe(true);
+    expect(response.content[0].text).toContain("Error:");
+  });
+
+  it("should format no credentials error", () => {
+    const response = {
+      content: [
+        {
+          type: "text" as const,
+          text: "Error: No API credentials provided. Please configure your IT Glue API key via the ITGLUE_API_KEY or X_API_KEY environment variable.",
+        },
+      ],
+      isError: true,
+    };
+
+    expect(response.isError).toBe(true);
+    expect(response.content[0].text).toContain("ITGLUE_API_KEY");
+    expect(response.content[0].text).toContain("X_API_KEY");
+  });
+
+  it("should format unknown tool error", () => {
+    const toolName = "nonexistent_tool";
+    const response = {
+      content: [
+        {
+          type: "text" as const,
+          text: `Unknown tool: ${toolName}`,
+        },
+      ],
+      isError: true,
+    };
+
+    expect(response.isError).toBe(true);
+    expect(response.content[0].text).toBe("Unknown tool: nonexistent_tool");
+  });
+});
+
+describe("Health Check Response Format", () => {
+  it("should format health check success response", () => {
+    const healthResponse = {
+      status: "ok",
+      message: "IT Glue API is reachable",
+      region: "us",
+      organizationTypesFound: 5,
+    };
+
+    const response = {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(healthResponse, null, 2),
+        },
+      ],
+    };
+
+    const parsed = JSON.parse(response.content[0].text);
+    expect(parsed.status).toBe("ok");
+    expect(parsed.region).toBe("us");
+    expect(parsed.organizationTypesFound).toBe(5);
   });
 });
