@@ -17,6 +17,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { setServerRef } from "./utils/server-ref.js";
 import { elicitText } from "./utils/elicitation.js";
+import { registerPromptHandlers } from "./prompts.js";
 
 // IT Glue region configuration
 type ITGlueRegion = "us" | "eu" | "au";
@@ -105,7 +106,7 @@ function buildFilterParams(filter: Record<string, unknown>): Record<string, stri
 }
 
 // Simple IT Glue client
-class ITGlueClient {
+export class ITGlueClient {
   private readonly apiKey: string;
   private readonly baseUrl: string;
 
@@ -261,6 +262,59 @@ class ITGlueClient {
   }
 }
 
+
+/**
+ * Create a document *with* its body content.
+ *
+ * IT Glue's Documents API accepts but does not persist a top-level `content`
+ * attribute on POST — documents are section-structured, so a document's body
+ * only exists once a child `document-sections` resource has been created.
+ * This helper performs the full flow: POST the document, then (if content was
+ * supplied) POST a `Document::Text` section against it.
+ *
+ * Payload shape verified live against IT Glue's API: the section-type lives
+ * in the `resource_type` attribute (values `Document::Text` or
+ * `Document::Heading`). The `section-type` field is accepted but ignored; a
+ * `relationships.resource` binding causes HTTP 400
+ * `"param is missing or the value is empty: resource_type"`.
+ *
+ * Returns the deserialized document resource (not the section) so the caller
+ * sees the same shape as a simple POST.
+ */
+export async function createDocumentWithContent(
+  client: ITGlueClient,
+  args: {
+    organization_id: number | string;
+    name: string;
+    content?: string;
+  }
+): Promise<Record<string, unknown>> {
+  const newDoc = await client.post<Record<string, unknown>>(
+    `/organizations/${args.organization_id}/relationships/documents`,
+    {
+      data: {
+        type: "documents",
+        attributes: { name: args.name },
+      },
+    }
+  );
+
+  if (args.content !== undefined && args.content !== "") {
+    const docId = String(newDoc.id);
+    await client.post(`/documents/${docId}/relationships/sections`, {
+      data: {
+        type: "document-sections",
+        attributes: {
+          resource_type: "Document::Text",
+          content: args.content,
+        },
+      },
+    });
+  }
+
+  return newDoc;
+}
+
 // Credential extraction from gateway headers
 interface GatewayCredentials {
   apiKey?: string;
@@ -291,7 +345,7 @@ function createClient(credentials: GatewayCredentials): ITGlueClient {
  * Create a fresh MCP Server with all tool handlers registered.
  * Called per-request in HTTP (stateless) mode so each initialize gets a clean server.
  */
-function createMcpServer(): Server {
+function createMcpServer(credentialOverrides?: GatewayCredentials): Server {
   const server = new Server(
     {
       name: "itglue-mcp",
@@ -300,10 +354,14 @@ function createMcpServer(): Server {
     {
       capabilities: {
         tools: {},
+        prompts: {},
       },
     }
   );
   setServerRef(server);
+
+  // Register prompt handlers
+  registerPromptHandlers(server);
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
@@ -899,7 +957,7 @@ function createMcpServer(): Server {
 // Handle tool calls
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
-  const credentials = getCredentialsFromEnv();
+  const credentials = credentialOverrides ?? getCredentialsFromEnv();
 
   if (!credentials.apiKey) {
     return {
@@ -1213,18 +1271,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             isError: true,
           };
         }
-        const newDoc = await client.post(
-          `/organizations/${args.organization_id}/relationships/documents`,
-          {
-            data: {
-              type: "documents",
-              attributes: {
-                name: args.name,
-                ...(args.content ? { content: args.content } : {}),
-              },
-            },
-          }
-        );
+        const newDoc = await createDocumentWithContent(client, {
+          organization_id: args.organization_id as number,
+          name: args.name as string,
+          content: args.content as string | undefined,
+        });
         return {
           content: [{ type: "text", text: JSON.stringify(newDoc, null, 2) }],
         };
@@ -1726,4 +1777,6 @@ async function main() {
   }
 }
 
-main().catch(console.error);
+if (process.env.NODE_ENV !== "test") {
+  main().catch(console.error);
+}
