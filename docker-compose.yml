@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: production
+      target: runner
     image: ghcr.io/wyre-technology/itglue-mcp:latest
     container_name: itglue-mcp-server
     restart: unless-stopped
