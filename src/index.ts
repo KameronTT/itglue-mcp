@@ -1597,76 +1597,92 @@ async function startHttpTransport(): Promise<void> {
   const isGatewayMode = process.env.AUTH_MODE === "gateway";
 
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-  const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
 
-  if (url.pathname === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      status: 'ok',
-      transport: 'sse',
-      authMode: isGatewayMode ? 'gateway' : 'env',
-      timestamp: new Date().toISOString(),
-    }));
-    return;
-  }
-  }
+    // Health check
+    if (url.pathname === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status: 'ok',
+        transport: 'sse',
+        authMode: isGatewayMode ? 'gateway' : 'env',
+        timestamp: new Date().toISOString(),
+      }));
+      return;
+    }
 
-  // 1. Establish the SSE Connection
-  if (url.pathname === '/sse') {
-    // Security: extract per-session credentials (prevents cross-tenant credential leak)
-    let gatewayCredentials: GatewayCredentials | undefined;
-    if (isGatewayMode) {
-      const headers = req.headers as Record<string, string | string[] | undefined>;
-      const apiKey =
-        (headers['x-itglue-api-key'] as string) ||
-        (headers['x-api-key'] as string);
-      if (!apiKey) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          error: 'Missing credentials',
-          message: 'Gateway mode requires X-ITGlue-API-Key header',
-        }));
+    // 1. Establish SSE connection
+    if (url.pathname === '/sse') {
+      // Security: extract per-session credentials to prevent cross-tenant leaks
+      let gatewayCredentials: GatewayCredentials | undefined;
+      if (isGatewayMode) {
+        const headers = req.headers as Record<string, string | string[] | undefined>;
+        const apiKey =
+          (headers['x-itglue-api-key'] as string) ||
+          (headers['x-api-key'] as string);
+        if (!apiKey) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            error: 'Missing credentials',
+            message: 'Gateway mode requires X-ITGlue-API-Key header',
+          }));
+          return;
+        }
+        const baseUrl = headers['x-itglue-base-url'] as string | undefined;
+        const region = headers['x-itglue-region'] as string | undefined;
+        gatewayCredentials = {
+          apiKey,
+          region: (region || 'us') as ITGlueRegion,
+          baseUrl: baseUrl || undefined,
+        };
+      }
+      const transport = new SSEServerTransport('/message', res);
+      const sessionId = Math.random().toString(36).substring(2);
+      sseTransports.set(sessionId, transport);
+      // Create isolated per-session server with scoped credentials
+      const sessionServer = createMcpServer(gatewayCredentials);
+      await sessionServer.connect(transport as any);
+      return;
+    }
+
+    // 2. Handle incoming JSON-RPC messages
+    if (url.pathname === '/message') {
+      if (req.method !== 'POST') {
+        res.writeHead(405);
+        res.end('Method Not Allowed');
         return;
       }
-      const baseUrl = headers['x-itglue-base-url'] as string | undefined;
-      const region = headers['x-itglue-region'] as string | undefined;
-      gatewayCredentials = {
-        apiKey,
-        region: (region || 'us') as ITGlueRegion,
-        baseUrl: baseUrl || undefined,
-      };
-    }
-    const transport = new SSEServerTransport('/message', res);
-    const sessionId = Math.random().toString(36).substring(2);
-    sseTransports.set(sessionId, transport);
-    // Create isolated per-session server with scoped credentials
-    const sessionServer = createMcpServer(gatewayCredentials);
-    await sessionServer.connect(transport as any);
-    return;
-  }
-
-  // 2. Handle incoming JSON-RPC messages from Hatz AI
-  if (url.pathname === '/message') {
-    if (req.method !== 'POST') {
-      res.writeHead(405);
-      res.end('Method Not Allowed');
+      const sessionId = url.searchParams.get('sessionId');
+      const transport = sseTransports.get(sessionId || '');
+      if (!transport) {
+        res.writeHead(404);
+        res.end('Session not found');
+        return;
+      }
+      await transport.handlePostMessage(req, res as any);
       return;
     }
-    const sessionId = url.searchParams.get('sessionId');
-    const transport = sseTransports.get(sessionId || '');
-    if (!transport) {
-      res.writeHead(404);
-      res.end('Session not found');
-      return;
-    }
-    await transport.handlePostMessage(req, res as any);
-    return;
+
+    res.writeHead(404);
+    res.end('Not found');
+  });
+
+  httpServer.listen(port, host, () => {
+    console.error(`IT Glue MCP server listening on http://${host}:${port}`);
+  });
+}
+
+// Start the server
+async function main() {
+  const transportType = process.env.MCP_TRANSPORT || 'stdio';
+  if (transportType === 'http') {
+    await startHttpTransport();
+  } else {
+    await startStdioTransport();
   }
+}
 
-  res.writeHead(404);
-  res.end('Not found');
-});
-
-httpServer.listen(port, host, () => {
-  console.error(`IT Glue MCP server listening on http://${host}:${port}`);
+main().catch((error) => {
+  console.error('Fatal error:', error);
+  process.exit(1);
 });
