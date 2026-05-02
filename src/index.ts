@@ -1256,7 +1256,7 @@ case "archive_document":
           number: (args?.page_number as number) || 1,
         };
         const result = await client.request(
-          `/folders`,
+          `/organizations/${args.organization_id}/relationships/document_folders`,
           params
         );
         return {
