@@ -1242,28 +1242,6 @@ case "archive_document":
         };
       }
 
-      case "list_document_folders": {
-        if (!args?.organization_id) {
-          return {
-            content: [{ type: "text", text: "Error: organization_id is required" }],
-            isError: true,
-          };
-        }
-        const params: Record<string, unknown> = {};
-        params["filter[organization_id]"] = args.organization_id;
-        params.page = {
-          size: Math.min((args?.page_size as number) || 50, 1000),
-          number: (args?.page_number as number) || 1,
-        };
-        const result = await client.request(
-          `/organizations/${args.organization_id}/relationships/document_folders`,
-          params
-        );
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        };
-      }
-
       case "search_contacts": {
         if (!args?.organization_id) {
           return {
