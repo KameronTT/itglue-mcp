@@ -9,7 +9,7 @@
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import {
   CallToolRequestSchema,
@@ -17,6 +17,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { setServerRef } from "./utils/server-ref.js";
 import { elicitText } from "./utils/elicitation.js";
+const sseTransports: Map<string, SSEServerTransport> = new Map();
 
 // IT Glue region configuration
 type ITGlueRegion = "us" | "eu" | "au";
@@ -1595,135 +1596,46 @@ async function startHttpTransport(): Promise<void> {
   const host = process.env.MCP_HTTP_HOST || "0.0.0.0";
   const isGatewayMode = process.env.AUTH_MODE === "gateway";
 
-  const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
-    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
 
-    // Health endpoint - no auth required
-    if (url.pathname === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          status: "ok",
-          transport: "http",
-          authMode: isGatewayMode ? "gateway" : "env",
-          timestamp: new Date().toISOString(),
-        })
-      );
-      return;
-    }
-
-    // MCP endpoint — stateless: fresh server + transport per request
-    if (url.pathname === "/mcp") {
-      // Only POST is supported in stateless mode
-      if (req.method !== "POST") {
-        res.writeHead(405, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          jsonrpc: "2.0",
-          error: { code: -32000, message: "Method not allowed" },
-          id: null,
-        }));
-        return;
-      }
-
-      // In gateway mode, extract credentials from headers
-      if (isGatewayMode) {
-        const headers = req.headers as Record<string, string | string[] | undefined>;
-        const apiKey =
-          (headers["x-itglue-api-key"] as string) ||
-          (headers["x-api-key"] as string);
-
-        if (!apiKey) {
-          res.writeHead(401, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              error: "Missing credentials",
-              message: "Gateway mode requires X-ITGlue-API-Key header",
-              required: ["X-ITGlue-API-Key"],
-            })
-          );
-          return;
-        }
-
-        process.env.ITGLUE_API_KEY = apiKey;
-
-        const baseUrl = headers["x-itglue-base-url"] as string | undefined;
-        if (baseUrl) {
-          process.env.ITGLUE_BASE_URL = baseUrl;
-        }
-
-        const region = headers["x-itglue-region"] as string | undefined;
-        if (region) {
-          process.env.ITGLUE_REGION = region;
-        }
-      }
-
-      // Stateless: create fresh server + transport for each request
-      const server = createMcpServer();
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: undefined,
-        enableJsonResponse: true,
-      });
-
-      res.on("close", () => {
-        transport.close();
-        server.close();
-      });
-
-      server.connect(transport as unknown as Transport).then(() => {
-        transport.handleRequest(req, res);
-      }).catch((err) => {
-        console.error("MCP transport error:", err);
-        if (!res.headersSent) {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({
-            jsonrpc: "2.0",
-            error: { code: -32603, message: "Internal error" },
-            id: null,
-          }));
-        }
-      });
-
-      return;
-    }
-
-    // 404 for everything else
-    res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Not found", endpoints: ["/mcp", "/health"] }));
-  });
-
-  await new Promise<void>((resolve) => {
-    httpServer.listen(port, host, () => {
-      console.error(`IT Glue MCP server listening on http://${host}:${port}/mcp`);
-      console.error(`Health check available at http://${host}:${port}/health`);
-      console.error(
-        `Authentication mode: ${isGatewayMode ? "gateway (header-based)" : "env (environment variables)"}`
-      );
-      resolve();
-    });
-  });
-
-  // Graceful shutdown
-  const shutdown = async () => {
-    console.error("Shutting down IT Glue MCP server...");
-    await new Promise<void>((resolve, reject) => {
-      httpServer.close((err) => (err ? reject(err) : resolve()));
-    });
-    process.exit(0);
-  };
-
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
-}
-
-// Start the server
-async function main() {
-  const transportType = process.env.MCP_TRANSPORT || "stdio";
-
-  if (transportType === "http") {
-    await startHttpTransport();
-  } else {
-    await startStdioTransport();
+  if (url.pathname === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok' }));
+    return;
   }
-}
 
-main().catch(console.error);
+  // 1. Establish the SSE Connection
+  if (url.pathname === '/sse') {
+    const transport = new SSEServerTransport('/message', res);
+    const sessionId = Math.random().toString(36).substring(2);
+    sseTransports.set(sessionId, transport);
+    await server.connect(transport as any);
+    return;
+  }
+
+  // 2. Handle incoming JSON-RPC messages from Hatz AI
+  if (url.pathname === '/message') {
+    if (req.method !== 'POST') {
+      res.writeHead(405);
+      res.end('Method Not Allowed');
+      return;
+    }
+    const sessionId = url.searchParams.get('sessionId');
+    const transport = sseTransports.get(sessionId || '');
+    if (!transport) {
+      res.writeHead(404);
+      res.end('Session not found');
+      return;
+    }
+    await transport.handlePostMessage(req, res as any);
+    return;
+  }
+
+  res.writeHead(404);
+  res.end('Not found');
+});
+
+httpServer.listen(port, host, () => {
+  console.error(`IT Glue MCP server listening on http://${host}:${port}`);
+});
