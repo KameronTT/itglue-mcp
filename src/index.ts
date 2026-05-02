@@ -10,6 +10,7 @@ import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import {
   CallToolRequestSchema,
@@ -1611,7 +1612,40 @@ async function startHttpTransport(): Promise<void> {
       return;
     }
 
-    // 1. Establish SSE connection
+    // 1a. StreamableHTTP /mcp endpoint (stateless, per-request credential isolation)
+    if (url.pathname === '/mcp') {
+      let gatewayCredentials: GatewayCredentials | undefined;
+      if (isGatewayMode) {
+        const headers = req.headers as Record<string, string | string[] | undefined>;
+        const apiKey =
+          (headers['x-itglue-api-key'] as string) ||
+          (headers['x-api-key'] as string);
+        if (!apiKey) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            error: 'Missing credentials',
+            message: 'Gateway mode requires X-ITGlue-API-Key header',
+          }));
+          return;
+        }
+        const baseUrl = headers['x-itglue-base-url'] as string | undefined;
+        const region = headers['x-itglue-region'] as string | undefined;
+        gatewayCredentials = {
+          apiKey,
+          region: (region || 'us') as ITGlueRegion,
+          baseUrl: baseUrl || undefined,
+        };
+      }
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+      });
+      const mcpServer = createMcpServer(gatewayCredentials);
+      await mcpServer.connect(transport);
+      await transport.handleRequest(req, res);
+      return;
+    }
+
+    // 1b. Establish SSE connection
     if (url.pathname === '/sse') {
       // Security: extract per-session credentials to prevent cross-tenant leaks
       let gatewayCredentials: GatewayCredentials | undefined;
